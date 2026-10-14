@@ -8,6 +8,9 @@ import { execFile } from "node:child_process";
 const PORT = Number(process.env.PORT || 8080);
 const VOLTAGE = process.env.VOLTAGE_BIN || `${process.env.HOME}/.local/bin/voltage`;
 const WALLET = process.env.VOLTAGE_WALLET || ""; // MutinyNet wallet UUID; payouts disabled when empty
+const ORG = process.env.VOLTAGE_ORG || "";
+const ENV = process.env.VOLTAGE_ENV || "";
+let walletNetwork = null; // must be "mutinynet" before any payout
 const BUYBACK = 0.5; // the racket
 const MAX_GRAMS = 60;
 const RESERVE_BUDGET_SATS = Number(process.env.RESERVE_BUDGET_SATS || 2000);
@@ -52,7 +55,7 @@ function pay(invoice, id) {
   return new Promise((resolve) => {
     execFile(
       VOLTAGE,
-      ["payments", "send", "--wallet", WALLET, "--invoice", invoice, "--id", id, "--wait", "completed", "--json", "--yes", "--timeout", "45"],
+      ["payments", "send", "--org", ORG, "--env", ENV, "--wallet", WALLET, "--currency", "btc", "--invoice", invoice, "--id", id, "--wait", "completed", "--json", "--yes", "--timeout", "45"],
       { timeout: 60_000 },
       (err, stdout, stderr) => {
         let out = null;
@@ -79,12 +82,14 @@ http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://x");
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/slides")) {
       const file = url.pathname === "/" ? "index.html" : "slides.html";
+      const html = await readFile(new URL(file, import.meta.url)).catch(() => null);
+      if (!html) return json(res, 404, { error: "not found" });
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      return res.end(await readFile(new URL(file, import.meta.url)));
+      return res.end(html);
     }
     if (req.method === "GET" && url.pathname === "/api/market") {
       await refreshMarket();
-      return json(res, 200, { ...market, buyback: BUYBACK, perCan: price(14.9), ledger, payoutsEnabled: Boolean(WALLET), reserveRemaining: RESERVE_BUDGET_SATS - ledger.satsPaid });
+      return json(res, 200, { ...market, buyback: BUYBACK, perCan: price(14.9), ledger, payoutsEnabled: Boolean(WALLET) && walletNetwork === "mutinynet", reserveRemaining: RESERVE_BUDGET_SATS - ledger.satsPaid });
     }
     if (req.method === "POST" && url.pathname === "/api/quote") {
       await refreshMarket();
@@ -106,7 +111,7 @@ http.createServer(async (req, res) => {
       const parsed = invoiceSats(inv);
       if (parsed.error) return json(res, 400, { error: parsed.error });
       if (parsed.sats !== q.sats) return json(res, 400, { error: `Invoice must be for exactly ${q.sats} sats (got ${parsed.sats ?? "no amount"}).` });
-      if (!WALLET) return json(res, 503, { error: "Reserve treasury offline (Voltage wallet not configured). No sats sent." });
+      if (!WALLET || walletNetwork !== "mutinynet") return json(res, 503, { error: "Reserve treasury offline (Voltage wallet not configured). No sats sent." });
       if (ledger.satsPaid + q.sats > RESERVE_BUDGET_SATS) return json(res, 503, { error: "The Reserve is tapped out." });
       q.status = "paying"; // single-flight: second redeem gets 409
       const r = await pay(inv, randomUUID());
@@ -123,6 +128,15 @@ http.createServer(async (req, res) => {
     }
     json(res, 404, { error: "not found" });
   } catch (e) {
+    if (res.headersSent) return res.end();
     json(res, 500, { error: String(e.message || e) });
   }
 }).listen(PORT, "127.0.0.1", () => console.log(`Strategic Aluminum Reserve on http://127.0.0.1:${PORT}`));
+
+// Safety: confirm the payout wallet is MutinyNet before enabling the treasury.
+if (WALLET) {
+  execFile(VOLTAGE, ["wallets", "get", WALLET, "--org", ORG, "--env", ENV, "--json"], (err, stdout) => {
+    try { walletNetwork = JSON.parse(stdout).data.network; } catch {}
+    console.log(`Treasury wallet network: ${walletNetwork} -> payouts ${walletNetwork === "mutinynet" ? "ENABLED" : "DISABLED"}`);
+  });
+}
