@@ -1,0 +1,5 @@
+.experience.json
+.env
+node_modules
+bin
+.wallet*
